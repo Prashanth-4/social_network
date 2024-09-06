@@ -1,11 +1,14 @@
-from rest_framework import generics, status
+from django.core.cache import cache
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
+from .manager import SocialNetworkManager
 from .models import CustomUser, FriendRequest
-from .serializers import UserSerializer, FriendRequestSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer, TokenObtainPairSerializer
+
 
 class SignupView(APIView):
     def post(self, request):
@@ -18,6 +21,7 @@ class SignupView(APIView):
         except Exception as e:
             return Response(str(e), status=status.HTTP_400_BAD_REQUEST)
 
+
 class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
@@ -26,60 +30,89 @@ class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
         token['email'] = user.email
         return token
 
+
 class MyTokenObtainPairView(TokenObtainPairView):
     serializer_class = MyTokenObtainPairSerializer
 
     def post(self, request, *args, **kwargs):
-        # Optionally override the post method to add custom behavior
         response = super().post(request, *args, **kwargs)
         return response
+
 
 class MyTokenRefreshSerializer(TokenRefreshSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
-        # Optionally add custom data to the response
         return data
+
 
 class MyTokenRefreshView(TokenRefreshView):
     serializer_class = MyTokenRefreshSerializer
 
     def post(self, request, *args, **kwargs):
-        # Optionally override the post method to add custom behavior
         response = super().post(request, *args, **kwargs)
         return response
 
-class SearchUserView(generics.ListAPIView):
-    serializer_class = UserSerializer
+
+class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def get_queryset(self):
-        query = self.request.query_params.get('q')
-        if query:
-            return CustomUser.objects.filter(models.Q(email__iexact=query) | models.Q(username__icontains=query))[:10]
-        return CustomUser.objects.none()
+    def post(self, request):
+        try:
+            refresh_token = request.data.get("refresh_token")
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+
+            return Response({"message": "Logout successfully"}, status=status.HTTP_205_RESET_CONTENT)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SearchUserView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            users = SocialNetworkManager.get_search_users(request)
+            return Response({'data': users}, 200)
+        except Exception as e:
+            return Response(str(e), 500)
+
 
 class FriendRequestView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        to_user_id = request.data.get('to_user')
-        if to_user_id:
-            to_user = CustomUser.objects.get(id=to_user_id)
-            friend_request, created = FriendRequest.objects.get_or_create(from_user=request.user, to_user=to_user)
-            if created:
-                return Response({"message": "Friend request sent"}, status=status.HTTP_201_CREATED)
-            return Response({"message": "Friend request already sent"}, status=status.HTTP_400_BAD_REQUEST)
-        return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            id = request.data.get('friend_request_id', '')
+            if not id:
+                cache_key = f"friend_request_{request.user.id}"
+                request_count = cache.get(cache_key, 0)
+                if request_count >= 3:
+                    return Response({
+                        "error": "Rate limit exceeded. You can only send 3 friend requests per minute."
+                    }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+                response = SocialNetworkManager.create_friend_request(request)
+                cache.set(cache_key, request_count + 1, timeout=60)
+            else:
+                response = SocialNetworkManager.accept_or_reject_request(id, request.data.get('request_type'))
+            return Response(response,200)
+        except Exception as e:
+            return Response(str(e), 500)
 
     def get(self, request):
-        received_requests = FriendRequest.objects.filter(to_user=request.user, status='pending')
-        serializer = FriendRequestSerializer(received_requests, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        try:
+            users = SocialNetworkManager.get_friend_requests(request)
+            return Response({'data': users}, 200)
+        except Exception as e:
+            return Response(str(e), 500)
+
 
 class FriendListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        friends = CustomUser.objects.filter(sent_requests__status='accepted', sent_requests__to_user=request.user) | CustomUser.objects.filter(received_requests__status='accepted', received_requests__from_user=request.user)
-        serializer = UserSerializer(friends, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        try:
+            friends = SocialNetworkManager.get_friends_list(request)
+            return Response({'data': friends}, 200)
+        except Exception as e:
+            return Response(str(e), 500)
